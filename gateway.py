@@ -1,19 +1,25 @@
 #!/usr/bin/env python3
 """
 Shell Gateway — 接收客户端提交的 shell 命令，分发给工作机执行，保存结果供客户端查询。
+使用 HMAC-SHA256 签名认证请求。
 """
 
+import hashlib
+import hmac
+import os
 import sqlite3
-import uuid
 import time
+import uuid
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
 DB_PATH = "gateway.db"
+SHARED_SECRET = os.environ.get("SHARED_SECRET", "")
+TIMESTAMP_WINDOW = 300  # 5 minutes
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("gateway")
@@ -43,6 +49,23 @@ def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
+def verify_hmac(method: str, path: str, auth_header: str, ts_header: str) -> bool:
+    """验证 HMAC-SHA256 签名。signature = HMAC(secret, ts\nmethod\npath)。"""
+    if not SHARED_SECRET:
+        return True
+    if not auth_header.startswith("HMAC-SHA256 "):
+        return False
+    try:
+        ts = int(ts_header)
+    except (ValueError, TypeError):
+        return False
+    if abs(int(time.time()) - ts) > TIMESTAMP_WINDOW:
+        return False
+    payload = f"{ts}\n{method}\n{path}".encode()
+    expected = hmac.new(SHARED_SECRET.encode(), payload, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(auth_header[12:], expected)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
@@ -50,6 +73,17 @@ async def lifespan(app: FastAPI):
     yield
 
 app = FastAPI(title="Shell Gateway", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def hmac_auth_middleware(request: Request, call_next):
+    if request.url.path == "/docs" or request.url.path.startswith("/openapi"):
+        return await call_next(request)
+    auth = request.headers.get("Authorization", "")
+    ts = request.headers.get("X-Timestamp", "")
+    if not verify_hmac(request.method, request.url.path, auth, ts):
+        return Response('{"detail":"unauthorized"}', status_code=401, media_type="application/json")
+    return await call_next(request)
 
 
 # ── Pydantic models ──────────────────────────────────────────────
@@ -157,5 +191,22 @@ def query_result(reqid: str):
 
 
 if __name__ == "__main__":
+    import argparse
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+    parser = argparse.ArgumentParser(description="Shell Gateway")
+    parser.add_argument("--host", default="0.0.0.0", help="Bind address")
+    parser.add_argument("--port", type=int, default=8000, help="Bind port")
+    parser.add_argument("--cert", help="TLS certificate file (.pem)")
+    parser.add_argument("--key", help="TLS private key file (.pem)")
+    args = parser.parse_args()
+
+    if args.cert and args.key:
+        logger.info("Starting with HTTPS: cert=%s key=%s", args.cert, args.key)
+        uvicorn.run(app, host=args.host, port=args.port,
+                    ssl_certfile=args.cert, ssl_keyfile=args.key)
+    elif args.cert or args.key:
+        logger.error("Both --cert and --key are required for HTTPS")
+    else:
+        logger.info("Starting with HTTP (no TLS)")
+        uvicorn.run(app, host=args.host, port=args.port)

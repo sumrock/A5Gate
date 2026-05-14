@@ -3,10 +3,12 @@
 Worker — 定时轮询 Gateway 获取新命令，用指定用户的 login shell 执行后回传结果。
 """
 
+import hashlib
+import hmac
+import os
 import subprocess
 import time
 import logging
-import os
 import argparse
 
 import httpx
@@ -17,6 +19,17 @@ logger = logging.getLogger("worker")
 DEFAULT_GATEWAY = "http://localhost:8000"
 POLL_INTERVAL = 2  # seconds
 EXEC_TIMEOUT = 300  # seconds
+
+SHARED_SECRET = os.environ.get("SHARED_SECRET", "")
+
+
+def auth_headers(method: str, path: str) -> dict:
+    if not SHARED_SECRET:
+        return {}
+    ts = str(int(time.time()))
+    payload = f"{ts}\n{method}\n{path}".encode()
+    sig = hmac.new(SHARED_SECRET.encode(), payload, hashlib.sha256).hexdigest()
+    return {"Authorization": f"HMAC-SHA256 {sig}", "X-Timestamp": ts}
 
 
 def run_as_user(command: str, user: str) -> tuple[str, str, int]:
@@ -50,14 +63,16 @@ def run_directly(command: str) -> tuple[str, str, int]:
 def main():
     parser = argparse.ArgumentParser(description="Shell Worker")
     parser.add_argument("--gateway", default=DEFAULT_GATEWAY, help="Gateway base URL")
+    parser.add_argument("--insecure", action="store_true", help="Disable TLS certificate verification")
     args = parser.parse_args()
 
-    client = httpx.Client(timeout=10)
+    client = httpx.Client(timeout=10, verify=not args.insecure)
     logger.info("Worker started, gateway=%s", args.gateway)
 
     while True:
         try:
-            resp = client.get(f"{args.gateway}/api/command/next")
+            poll_path = "/api/command/next"
+            resp = client.get(f"{args.gateway}{poll_path}", headers=auth_headers("GET", poll_path))
             data = resp.json()
         except Exception as e:
             logger.error("Failed to poll gateway: %s", e)
@@ -78,9 +93,11 @@ def main():
         logger.info("Finished: reqid=%s exit_code=%d", reqid, exit_code)
 
         try:
+            result_path = f"/api/command/{reqid}/result"
             client.post(
-                f"{args.gateway}/api/command/{reqid}/result",
+                f"{args.gateway}{result_path}",
                 json={"stdout": stdout, "stderr": stderr, "exit_code": exit_code},
+                headers=auth_headers("POST", result_path),
             )
             logger.info("Result posted: reqid=%s", reqid)
         except Exception as e:
